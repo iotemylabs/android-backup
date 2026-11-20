@@ -1,35 +1,44 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>android-backup</Name>
-  <Repository>louij2/android-backup:latest</Repository>
-  <Registry>https://hub.docker.com/r/louij2/android-backup</Registry>
+  <Repository>ghcr.io/iotemylabs/android-backup:latest</Repository>
+  <Registry>https://github.com/iotemylabs/android-backup/pkgs/container/android-backup</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/louij2/android-backup/issues</Support>
-  <Project>https://github.com/louij2/android-backup</Project>
-  <ReadMe>https://raw.githubusercontent.com/louij2/android-backup/main/README.md</ReadMe>
-  <Overview>Backs up Android phones and tablets to your array over ADB, with no root and no app on the device. Plug a device in, or give it a Wi-Fi address, and it gets one backup per day: shared storage (photos, downloads, documents), every user-installed APK, contacts as vCard, SMS and call log in SMS Backup &amp; Restore format, and settings. Files deleted on the phone are kept in the backup. Private app data (logins, app databases) can't be backed up without root. Status page + Prometheus /metrics on port 9872, optional Discord alerts.</Overview>
+  <Support>https://github.com/iotemylabs/android-backup/issues</Support>
+  <Project>https://github.com/iotemylabs/android-backup</Project>
+  <ReadMe>https://raw.githubusercontent.com/iotemylabs/android-backup/main/README.md</ReadMe>
+  <Overview>Backs up Android phones and tablets to your array over ADB, with no root and no app on the device. Plug a device in, or give it a Wi-Fi address, and it gets one backup per day: shared storage (photos, downloads, documents), every user-installed APK, contacts as vCard, SMS and call log in SMS Backup &amp; Restore format, the calendar, and settings. The previous copy of a changed file is kept for 30 days. Files deleted on the phone are kept in the backup. Private app data (logins, app databases) can't be backed up without root. Status page + Prometheus /metrics on port 9872, a Home Assistant sensor endpoint, and Apprise alerts (ntfy, Home Assistant, Discord and more). The status page has no login: keep it on your LAN.</Overview>
   <Category>Backup: Tools:</Category>
   <WebUI>http://[IP]:[PORT:9872]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/louij2/unraid-templates/master/templates/android-backup.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/louij2/android-backup/main/unraid/icon.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/iotemylabs/android-backup/main/unraid/android-backup.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/iotemylabs/android-backup/main/unraid/icon.png</Icon>
   <ExtraParams>--restart=unless-stopped --device-cgroup-rule='c 189:* rmw'</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <Requires>USB debugging turned on on each device, and "Allow" tapped once when it's first connected.</Requires>
-  <Config Name="Web UI" Target="9872" Default="9872" Mode="tcp" Description="Status page and /metrics" Type="Port" Display="always" Required="true" Mask="false">9872</Config>
+  <Config Name="Web UI" Target="9872" Default="9872" Mode="tcp" Description="Status page, /metrics and /api/ha. There is no login, so do not publish this port outside your LAN." Type="Port" Display="always" Required="true" Mask="false">9872</Config>
   <Config Name="Backups" Target="/backups" Default="/mnt/user/backups/android" Mode="rw" Description="Each device gets a &lt;model&gt;-&lt;serial&gt; folder. It holds messages and contacts in plain text, so use a private share." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/backups/android</Config>
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/android-backup" Mode="rw" Description="State, logs and the adb key devices trust; keep this folder private" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/android-backup</Config>
   <Config Name="USB devices" Target="/dev/bus/usb" Default="/dev/bus/usb" Mode="rw" Description="For devices plugged into the server" Type="Path" Display="advanced" Required="false" Mask="false">/dev/bus/usb</Config>
   <Config Name="Backup interval (hours)" Target="BACKUP_INTERVAL_HOURS" Default="24" Mode="" Description="Minimum time between good backups of a device" Type="Variable" Display="always" Required="true" Mask="false">24</Config>
   <Config Name="Wi-Fi devices" Target="ADB_TARGETS" Default="" Mode="" Description="Optional comma list of host:port, e.g. 192.168.1.50:5555. See the README for setup." Type="Variable" Display="always" Required="false" Mask="false"/>
-  <Config Name="TZ" Target="TZ" Default="Europe/London" Mode="" Description="Timezone for logs and snapshot dates" Type="Variable" Display="always" Required="false" Mask="false">Europe/London</Config>
-  <Config Name="Discord webhook" Target="DISCORD_WEBHOOK_URL" Default="" Mode="" Description="Optional: alert on failed backups" Type="Variable" Display="always" Required="false" Mask="true"/>
-  <Config Name="Notify on success" Target="NOTIFY_SUCCESS" Default="false" Mode="" Description="true = also post successful backups" Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="TZ" Target="TZ" Default="America/New_York" Mode="" Description="Timezone for logs and snapshot dates" Type="Variable" Display="always" Required="false" Mask="false">America/New_York</Config>
+  <Config Name="Apprise URLs" Target="APPRISE_URLS" Default="" Mode="" Description="Where alerts go: Apprise URLs separated by spaces, e.g. ntfys://TOKEN@ntfy.example.com/backups hassio://HA_HOST/LONG_LIVED_TOKEN. A URL gets every event; put event names in front (stale,failed=URL) to limit it. These hold tokens, so the field is masked. See the README." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Notify on success" Target="NOTIFY_SUCCESS" Default="false" Mode="" Description="true = also send an alert for each successful backup" Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+  <Config Name="Apprise config file" Target="APPRISE_CONFIG" Default="" Mode="" Description="Optional: an Apprise config file to use as well as, or in place of, the URLs above, e.g. /config/apprise.yml" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Events to send" Target="NOTIFY_EVENTS" Default="" Mode="" Description="Comma list from: started, success, failed, needs_unlock, unauthorized, wifi_lost, stale. Blank = all but started and success (only failed when just the legacy Discord webhook is set). A choice saved under Alert settings on the status page wins over this." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Stale after (hours)" Target="STALE_HOURS" Default="48" Mode="" Description="Alert once when a device has had no good backup for this long. 0 = off" Type="Variable" Display="advanced" Required="false" Mask="false">48</Config>
+  <Config Name="Wi-Fi lost after (hours)" Target="WIFI_LOST_HOURS" Default="6" Mode="" Description="Alert once when a Wi-Fi device address has been unreachable for this long (a phone forgets adb tcpip 5555 when it reboots). 0 = off" Type="Variable" Display="advanced" Required="false" Mask="false">6</Config>
+  <Config Name="Discord webhook (legacy)" Target="DISCORD_WEBHOOK_URL" Default="" Mode="" Description="Legacy, prefer Apprise URLs. An existing webhook keeps working: failed backups are posted to it." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Retry minutes" Target="RETRY_MINUTES" Default="60" Mode="" Description="Wait after a failed attempt" Type="Variable" Display="advanced" Required="false" Mask="false">60</Config>
   <Config Name="Mobile data limit (MB)" Target="MOBILE_DATA_LIMIT_MB" Default="500" Mode="" Description="On mobile data (e.g. Tailscale over LTE) a backup copies new files up to this much, plus contacts/SMS; app updates and the rest wait for Wi-Fi" Type="Variable" Display="advanced" Required="false" Mask="false">500</Config>
   <Config Name="Snapshots to keep" Target="KEEP_SNAPSHOTS" Default="30" Mode="" Description="Dated contacts/SMS/settings snapshots per device" Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
+  <Config Name="Only while charging" Target="ONLY_WHEN_CHARGING" Default="false" Mode="" Description="true = a scheduled backup waits until the device is on a charger. Back up now always runs." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+  <Config Name="Backup window" Target="BACKUP_WINDOW" Default="" Mode="" Description="Optional: scheduled backups only start between these times, e.g. 01:00-06:00. Blank = any time. Back up now always runs." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Keep old versions (days)" Target="VERSION_DAYS" Default="30" Mode="" Description="When a file changes on the device, its previous copy is kept in versions/ for this many days. 0 = overwrite, keep nothing" Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
+  <Config Name="Largest file to version (MB)" Target="VERSION_MAX_MB" Default="500" Mode="" Description="A changed file bigger than this is overwritten without keeping its previous copy" Type="Variable" Display="advanced" Required="false" Mask="false">500</Config>
   <Config Name="Only these serials" Target="SERIALS" Default="" Mode="" Description="Optional comma list; default = every authorised device" Type="Variable" Display="advanced" Required="false" Mask="false"/>
 </Container>

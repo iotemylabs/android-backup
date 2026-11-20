@@ -4,9 +4,10 @@ Any authorised device that is plugged in, or reachable at an ADB_TARGETS address
 once every BACKUP_INTERVAL_HOURS. Each device gets <backup dir>/<model>-<serial>/:
 
   files/       mirror of shared storage (/sdcard). Files deleted on the phone are kept here.
+  versions/    <date>/ the previous copy of each file that changed on the phone
   sd-<id>/     the same for an SD card, if there is one
   apks/        <package>/<versionCode>/*.apk for every user-installed app
-  snapshots/   <date>/ contacts.vcf, sms.xml, calls.xml, packages.txt, settings and getprop
+  snapshots/   <date>/ contacts.vcf, sms.xml, calls.xml, calendar.ics, packages.txt, settings and getprop
 
 Private app data (/data/data) can't be reached without root.
 
@@ -18,7 +19,6 @@ Commands:
 """
 import argparse
 import datetime as dt
-import html
 import json
 import os
 import re
@@ -28,12 +28,11 @@ import sys
 import threading
 import time
 import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
-from . import __version__
+from . import __version__, alerts, page
 
 CONFIG = Path(os.environ.get("CONFIG_DIR", "/config"))
 BACKUPS = Path(os.environ.get("BACKUP_DIR", "/backups"))
@@ -47,10 +46,12 @@ EXCLUDE = re.compile(os.environ.get(
 KEEP_SNAPSHOTS = int(os.environ.get("KEEP_SNAPSHOTS", "30"))
 MOBILE_LIMIT = float(os.environ.get("MOBILE_DATA_LIMIT_MB", "500")) * 1e6
 PORT = int(os.environ.get("PORT", "9872"))
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-NOTIFY_SUCCESS = os.environ.get("NOTIFY_SUCCESS", "false").lower() in ("1", "true", "yes")
 PUID = int(os.environ.get("PUID", "99"))  # Unraid's nobody:users, so the backups are usable over SMB
 PGID = int(os.environ.get("PGID", "100"))
+VERSION_DAYS = float(os.environ.get("VERSION_DAYS") or 30)  # 0 = overwrite changed files, as upstream does
+VERSION_MAX = float(os.environ.get("VERSION_MAX_MB") or 500) * 1e6
+ONLY_WHEN_CHARGING = os.environ.get("ONLY_WHEN_CHARGING", "false").lower() in ("1", "true", "yes")
+BACKUP_WINDOW = os.environ.get("BACKUP_WINDOW", "").strip()  # e.g. 01:00-06:00; blank = any time
 POLL_SECONDS = 30
 CONNECT_EVERY = 300
 
@@ -58,7 +59,8 @@ STATE_FILE = CONFIG / "state.json"
 LOG_DIR = CONFIG / "logs"
 _lock = threading.Lock()  # one backup at a time
 _state_lock = threading.Lock()
-_seen = {"ready": {}, "unauthorized": [], "connected": {}}  # latest poll
+_seen = {"ready": {}, "unauthorized": [], "connected": {}, "online": set()}  # latest poll
+_notes = {"wifi": ""}  # the last Switch to Wi-Fi result, for the status page
 
 
 def log(msg):
@@ -116,7 +118,7 @@ def list_devices():
         lines = adb("devices", timeout=30).stdout.splitlines()[1:]
     except subprocess.TimeoutExpired:
         return {}, []
-    ready, unauthorized = {}, []
+    ready, unauthorized, online = {}, [], set()
     for line in lines:
         parts = line.split()
         if len(parts) < 2:
@@ -125,6 +127,7 @@ def list_devices():
         if status == "unauthorized":
             unauthorized.append(address)
         elif status == "device":
+            online.add(address)  # every address, so a Wi-Fi target still counts while USB is the best one
             try:
                 serial = shell(address, "getprop ro.serialno", timeout=20).stdout.strip()
             except subprocess.TimeoutExpired:
@@ -137,6 +140,7 @@ def list_devices():
                 serial = address
             if serial not in ready or not is_network:
                 ready[serial] = address
+    _seen["online"] = online
     return ({s: a for s, a in ready.items() if not SERIALS or s in SERIALS}, unauthorized)
 
 
@@ -170,22 +174,13 @@ def device_label(adb_serial, serial):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", model) + "-" + re.sub(r"[^A-Za-z0-9._-]+", "_", serial)
 
 
-# --- notify --------------------------------------------------------------------------
-
-def notify(text):
-    if not WEBHOOK:
-        return
-    try:
-        req = urllib.request.Request(WEBHOOK, data=json.dumps({"content": text}).encode(),
-                                     headers={"Content-Type": "application/json", "User-Agent": "android-backup"})
-        urllib.request.urlopen(req, timeout=15).read()
-    except Exception as e:  # never let a webhook failure break a backup
-        log(f"webhook failed: {e}")
-
-
 # --- shared storage + APKs -----------------------------------------------------------
 
 class Disconnected(Exception):
+    pass
+
+
+class NeedsUnlock(RuntimeError):  # its own alert: the fix is a tap, not a look at the logs
     pass
 
 
@@ -214,7 +209,7 @@ def list_files(a, root):
     if len(lines) < expected - max(10, expected // 100):  # a few files can vanish between the two commands
         raise RuntimeError(f"incomplete listing of {root}: {len(lines)} of {expected} files")
     if root == "/sdcard/" and not lines:  # before the first unlock after a reboot, shared storage looks empty
-        raise RuntimeError("shared storage is empty or unreadable (unlock the phone once after a reboot)")
+        raise NeedsUnlock("shared storage is empty or unreadable (unlock the phone once after a reboot)")
     out = []
     for line in lines:
         m = STAT_RE.match(line)
@@ -242,6 +237,35 @@ def pull(a, remote, dest, size=0):
     return None
 
 
+def version_path(top, folder, rel, old_size):
+    """Where today's previous copy of a changed file goes, or None when versions are off or it is too big."""
+    if not VERSION_DAYS or old_size > VERSION_MAX:
+        return None
+    return top / "versions" / f"{dt.date.today():%Y-%m-%d}" / folder / rel
+
+
+def keep_version(dest, keep):
+    """Hold on to the copy that is about to be replaced, so a file damaged on the phone can't erase the good one.
+
+    A hard link costs no space or time. A share that can't link gets a real copy.
+    """
+    if not keep or keep.exists() or not dest.exists():  # the first copy of the day is the one worth keeping
+        return False
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(dest, keep)
+    except OSError:
+        shutil.copy2(dest, keep)
+    return True
+
+
+def prune_versions(top):
+    cutoff = f"{dt.date.today() - dt.timedelta(days=VERSION_DAYS):%Y-%m-%d}"
+    for old in (top / "versions").glob("*"):
+        if VERSION_DAYS and old.name < cutoff:
+            shutil.rmtree(old, ignore_errors=True)
+
+
 def sync_files(a, serial, top, lf, limit=None):
     """Copy new and changed files. With a byte limit, files past it wait for the next run."""
     todo, n_files = [], 0
@@ -249,13 +273,15 @@ def sync_files(a, serial, top, lf, limit=None):
         files = list_files(a, root)
         n_files += len(files)
         for size, mtime, rel in files:
+            keep = None
             try:
                 st = (top / folder / rel).stat()
                 if st.st_size == size and abs(st.st_mtime - mtime) <= 1:
                     continue
+                keep = version_path(top, folder, rel, st.st_size)
             except OSError:
                 pass
-            todo.append((size, root, folder, rel))
+            todo.append((size, root, folder, rel, keep))
     deferred = 0
     if limit is not None:
         kept, budget = [], limit
@@ -271,9 +297,12 @@ def sync_files(a, serial, top, lf, limit=None):
     log(f"{serial}: {n_files} files on the device, {len(todo)} to copy ({total / 1e9:.2f} GB)"
         + (f", {deferred / 1e9:.2f} GB waiting for Wi-Fi" if deferred else ""))
     last_pct = -1
-    for size, root, folder, rel in todo:
+    for size, root, folder, rel, keep in todo:
+        kept = keep_version(top / folder / rel, keep)
         err = pull(a, root + rel, top / folder / rel, size)
         if err:
+            if kept:
+                keep.unlink(missing_ok=True)  # nothing was replaced, so it isn't an older version
             if not online(a):
                 raise Disconnected("device went away during the file copy")
             failed += 1
@@ -285,6 +314,7 @@ def sync_files(a, serial, top, lf, limit=None):
         if pct != last_pct:
             last_pct = pct
             update_state(serial, progress=pct)
+    prune_versions(top)
     return n_files, copied, failed, done, deferred
 
 
@@ -412,6 +442,50 @@ def export_contacts(a, path):
     return len(people)
 
 
+EVENT_COLUMNS = ["_id", "dtstart", "dtend", "allDay", "deleted", "duration", "rrule", "eventLocation", "title",
+                 "description"]
+
+
+def ics_text(value):
+    value = "" if value == "null" else value
+    return value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\r", "").replace("\n", "\\n")
+
+
+def ics_time(ms, all_day):
+    when = dt.datetime.fromtimestamp(int(ms) / 1000, dt.timezone.utc)
+    return f";VALUE=DATE:{when:%Y%m%d}" if all_day else f":{when:%Y%m%dT%H%M%SZ}"
+
+
+def ics_event(row):
+    """One VEVENT, or None for a deleted row or one with no start."""
+    if row["deleted"] == "1" or not row["dtstart"].isdigit():
+        return None
+    all_day = row["allDay"] == "1"
+    lines = ["BEGIN:VEVENT", f"UID:{row['_id']}@android-backup", "DTSTART" + ics_time(row["dtstart"], all_day)]
+    if row["dtend"].isdigit():
+        lines.append("DTEND" + ics_time(row["dtend"], all_day))
+    elif row["duration"] != "null":  # a repeating event has a duration, not an end
+        lines.append(f"DURATION:{row['duration']}")
+    if row["rrule"] != "null":
+        lines.append(f"RRULE:{row['rrule']}")
+    for prop, col in (("SUMMARY", "title"), ("LOCATION", "eventLocation"), ("DESCRIPTION", "description")):
+        if row[col] != "null" and row[col]:
+            lines.append(f"{prop}:{ics_text(row[col])}")
+    return lines + ["END:VEVENT"]
+
+
+def export_calendar(a, path):
+    """Every calendar on the phone as one .ics file, which any calendar app can import."""
+    events = [e for e in map(ics_event, query(a, "content://com.android.calendar/events", EVENT_COLUMNS)) if e]
+    with open(path, "w", encoding="utf-8", errors="replace", newline="") as f:
+        f.write("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//android-backup//EN\r\n")
+        for lines in events:
+            for line in lines:  # RFC 5545: a line is at most 75 characters; a continuation starts with a space
+                f.write("\r\n ".join(line[i:i + 73] for i in range(0, len(line), 73)) + "\r\n")
+        f.write("END:VCALENDAR\r\n")
+    return len(events)
+
+
 SMS_COLUMNS = ["address", "date", "date_sent", "type", "read", "status", "locked", "protocol", "service_center",
                "subject", "body"]
 CALL_COLUMNS = ["number", "duration", "date", "type", "presentation", "name"]
@@ -445,6 +519,7 @@ def snapshot(a, top, lf):
     attempt("contacts", lambda: export_contacts(a, snap / "contacts.vcf"))
     attempt("sms", sms)
     attempt("calls", calls)
+    attempt("events", lambda: export_calendar(a, snap / "calendar.ics"))
     for name, command in (("packages.txt", "pm list packages -f --show-versioncode"), ("getprop.txt", "getprop"),
                           ("settings-global.txt", "settings list global"), ("settings-secure.txt", "settings list secure"),
                           ("settings-system.txt", "settings list system")):
@@ -497,7 +572,9 @@ def backup_one(serial, a):
     light = on_mobile_data(a)
     update_state(serial, name=label, running=True, last_attempt=started, transport=transport, progress=0)
     log(f"{label}: backup starting over {transport}" + (" (mobile data: light mode)" if light else ""))
-    gone = False
+    shown = load_state().get(serial, {}).get("nickname") or label  # the folder keeps <model>-<serial>
+    alerts.backup_started(shown, transport, light)
+    gone = locked = False
     try:
         with open(logfile, "wb") as lf:
             n_files, copied, failed, copied_bytes, deferred = sync_files(
@@ -522,19 +599,55 @@ def backup_one(serial, a):
     except Disconnected as e:
         message, ok, gone, fields = str(e), False, True, {}
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
-        message, ok, fields = str(e)[-300:], False, {}
+        message, ok, locked, fields = str(e)[-300:], False, isinstance(e, NeedsUnlock), {}
     fix_ownership(top)
     duration = time.time() - started
     update_state(serial, running=False, last_rc=0 if ok else 1, last_duration=round(duration), last_message=message,
-                 last_log=str(logfile), size_bytes=backup_size(top), **fields)
+                 needs_unlock=locked, last_log=str(logfile), size_bytes=backup_size(top), **fields)
     log(f"{label}: {'OK' if ok else 'FAILED'} in {duration:.0f}s: {message}")
     for old in sorted(LOG_DIR.glob(f"{label}-*.log"))[:-30]:  # keep the last 30 logs per device
         old.unlink(missing_ok=True)
-    if ok and NOTIFY_SUCCESS:
-        notify(f"✅ Android backup OK: **{label}**: {message}")
-    elif not ok and not gone:  # unplugging mid-run isn't a failure; it resumes next time
-        notify(f"⚠️ Android backup FAILED: **{label}**: {message}")
+    alerts.backup_result(serial, shown, ok, gone, locked, message)
     return ok
+
+
+def window(text):
+    """(start, end) times from "HH:MM-HH:MM", or None for any time."""
+    try:
+        start, end = (dt.time.fromisoformat(part.strip()) for part in text.split("-"))
+        return start, end
+    except ValueError:
+        if text:
+            log(f"BACKUP_WINDOW {text!r} isn't HH:MM-HH:MM, so backups can run at any time")
+        return None
+
+
+WINDOW = window(BACKUP_WINDOW)
+_charging = {}  # serial -> (when asked, answer): due() runs every few seconds, the phone needn't be asked that often
+
+
+def in_window(now):
+    if not WINDOW:
+        return True
+    start, end = WINDOW
+    return start <= now < end if start <= end else now >= start or now < end  # 22:00-06:00 runs past midnight
+
+
+def charging(serial, a):
+    """True when the device is on a charger. If the phone can't be asked, wait: a backup can drain a battery."""
+    asked, answer = _charging.get(serial, (0, False))
+    if time.time() - asked >= 60:
+        try:
+            answer = bool(re.search(r"(AC|USB|Wireless|Dock) powered: true", shell(a, "dumpsys battery", timeout=30).stdout))
+        except subprocess.TimeoutExpired:
+            answer = False
+        _charging[serial] = (time.time(), answer)
+    return answer
+
+
+def allowed_now(serial, a):
+    """The rules for a scheduled backup. "Back up now" doesn't ask."""
+    return in_window(dt.datetime.now().time()) and (not ONLY_WHEN_CHARGING or charging(serial, a))
 
 
 def due(serial, a):
@@ -544,8 +657,14 @@ def due(serial, a):
     if now - s.get("last_attempt", 0) < RETRY_MINUTES * 60:
         return False
     if now - s.get("last_success", 0) >= INTERVAL_HOURS * 3600:
-        return True
-    return bool(s.get("light")) and not on_mobile_data(a)
+        return allowed_now(serial, a)
+    return bool(s.get("light")) and not on_mobile_data(a) and allowed_now(serial, a)
+
+
+def schedule_rules():
+    rules = (["only while charging"] if ONLY_WHEN_CHARGING else []) + (
+        [f"between {WINDOW[0]:%H:%M} and {WINDOW[1]:%H:%M}"] if WINDOW else [])
+    return ", ".join(rules)
 
 
 def poller():
@@ -571,6 +690,7 @@ def poller():
             last_connect = time.time()
         ready, unauthorized = list_devices()
         _seen.update(ready=ready, unauthorized=unauthorized, connected={s: transport_of(a) for s, a in ready.items()})
+        alerts.check_devices(ready, unauthorized, _seen["online"], TARGETS)
         time.sleep(POLL_SECONDS)
 
 
@@ -582,6 +702,13 @@ def watcher():
                 with _lock:
                     backup_one(serial, a)
         time.sleep(5)
+
+
+def stale_watch():
+    """Its own light timer, so a stuck adb call in the poller can't hold up the stale alert."""
+    while True:
+        alerts.check_stale(load_state())
+        time.sleep(60)
 
 
 def run_now(serials=None):
@@ -637,38 +764,82 @@ def metrics():
     return "\n".join(lines) + "\n"
 
 
+def iso(ts):
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(timespec="seconds") if ts else None
+
+
+def devices():
+    """Every known or connected device, as the status page and /api/ha both show it."""
+    st = load_state()
+    out = []
+    for serial in sorted(set(st) | set(_seen["connected"])):
+        s = st.get(serial, {})
+        running = bool(s.get("running"))
+        result = "running" if running else "never" if "last_rc" not in s else "ok" if s["last_rc"] == 0 else (
+            "needs_unlock" if s.get("needs_unlock") else "failed")
+        transport = _seen["connected"].get(serial) or s.get("transport")
+        out.append({
+            "serial": serial, "name": s.get("name", serial), "nickname": s.get("nickname", ""), "result": result,
+            "running": running, "progress": s.get("progress", 0) if running else 0,
+            "connected": serial in _seen["connected"],
+            "transport": {"usb": "USB", "wifi": "Wi-Fi"}.get(transport),
+            "last_success": s.get("last_success"), "last_attempt": s.get("last_attempt"),
+            "size_bytes": s.get("size_bytes", 0), "duration_seconds": s.get("last_duration"),
+            "message": s.get("last_message", "")})
+    return out
+
+
+def ha_status():
+    """One flat entry per phone for Home Assistant's REST sensor: /api/status is keyed by serial,
+    which a sensor template can't walk without knowing it."""
+    out = []
+    for d in devices():
+        d["last_backup"], d["last_attempt"] = iso(d.pop("last_success")), iso(d["last_attempt"])
+        out.append(d)
+    return out
+
+
 def fmt_ts(ts):
     return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "never"
 
 
 def status_page():
-    st = load_state()
-    rows = []
-    for serial in sorted(set(st) | set(_seen["connected"])):
-        s = st.get(serial, {})
-        badge = f"running {s.get('progress', 0)}%" if s.get("running") else (
-            "ok" if s.get("last_rc") == 0 else ("failed" if "last_rc" in s else "pending"))
-        link = _seen["connected"].get(serial)
-        q = urllib.parse.quote(serial, safe="")
-        rows.append(
-            f"<tr><td>{html.escape(s.get('name', serial))}<br><small>{html.escape(serial)}</small></td>"
-            f"<td class={badge.split()[0]}>{badge}</td><td>{link or 'away'}</td><td>{fmt_ts(s.get('last_success'))}</td>"
-            f"<td>{s.get('size_bytes', 0) / 1e9:.1f} GB</td>"
-            f"<td><small>{html.escape(s.get('last_message', ''))}</small></td>"
-            f"<td><form method=post action='/api/backup?serial={q}'><button>Back up now</button></form></td></tr>")
-    waiting = "".join(f"<p class=failed>⚠ <b>{html.escape(a)}</b>: tap <b>Allow</b> on the device (tick “Always allow”).</p>"
-                      for a in _seen["unauthorized"])
-    return f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
-<title>android-backup</title><style>
-body{{font:14px system-ui,sans-serif;margin:16px;color:#222;background:#fafafa}}
-table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}
-.ok{{color:#15803d}}.failed{{color:#b91c1c}}.running{{color:#1d4ed8}}.pending{{color:#666}}
-@media (prefers-color-scheme:dark){{body{{background:#111;color:#ddd}}td,th{{border-color:#333}}}}
-</style><h2>android-backup {__version__}</h2>
-<p>Every {INTERVAL_HOURS:g} h per device, whenever it's connected &middot; backups in <code>{BACKUPS}</code></p>{waiting}
-<table><tr><th>Device</th><th>Status</th><th>Link</th><th>Last success</th><th>Size</th><th>Last result</th><th></th></tr>
-{''.join(rows) or '<tr><td colspan=7>No devices yet. Turn on USB debugging and plug one in.</td></tr>'}
-</table>"""
+    return page.render(devices(), _seen["unauthorized"], version=__version__, interval=INTERVAL_HOURS, backups=BACKUPS,
+                       alert_summary=alerts.summary() or "", last_test=alerts.last_test, stale_hours=alerts.STALE_HOURS,
+                       enabled=alerts.events(), note=_notes["wifi"], rules=schedule_rules())
+
+
+def enable_wifi(serial):
+    """`adb tcpip 5555` for a device on USB, and the address to put in ADB_TARGETS. Returns a line for the page.
+
+    Android forgets this on every reboot, so it is a button, not a one-off setup command.
+    """
+    a = _seen["ready"].get(serial)
+    if not a or transport_of(a) != "usb":
+        return "Plug the device in over USB first."
+    if not _lock.acquire(blocking=False):  # tcpip restarts adb on the device, which would cut a backup off
+        return "A backup is running. Try again when it has finished."
+    try:
+        found = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", shell(a, "ip -f inet addr show wlan0", timeout=20).stdout)
+        if not found:
+            return "The device isn't on Wi-Fi, so it has no address to back up from."
+        if adb("-s", a, "tcpip", "5555", timeout=30).returncode != 0:
+            return "The device refused to switch. Check that USB debugging is still on."
+    except subprocess.TimeoutExpired:
+        return "The device didn't answer. Unlock it and try again."
+    finally:
+        _lock.release()
+    target = f"{found.group(1)}:5555"
+    return (f"Done. {target} is already in ADB_TARGETS, so it can be unplugged." if target in TARGETS else
+            f"Done. Add {target} to ADB_TARGETS in the container settings, then it can be unplugged.")
+
+
+def set_nickname(serial, text):
+    """A display name only: the backup folder stays <model>-<serial>, so renaming can't orphan a backup."""
+    if serial not in load_state() and serial not in _seen["connected"]:
+        return False
+    update_state(serial, nickname=" ".join(text.split())[:40])
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -683,6 +854,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/metrics"):
             self._send(200, metrics(), "text/plain; version=0.0.4")
+        elif self.path.startswith("/setup-guide.txt"):
+            self._send(200, page.guide_text(), "text/plain; charset=utf-8")
+        elif self.path.startswith("/api/ha"):
+            self._send(200, json.dumps(ha_status(), indent=1), "application/json")
         elif self.path.startswith("/api/status"):
             self._send(200, json.dumps(load_state(), indent=1), "application/json")
         elif self.path == "/":
@@ -690,13 +865,29 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "not found", "text/plain")
 
+    def _form(self):
+        length = min(int(self.headers.get("Content-Length") or 0), 2000)
+        return urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+
     def do_POST(self):
-        if not self.path.startswith("/api/backup"):
+        if self.path.startswith("/api/notify-test"):
+            alerts.test()  # in the request, so the page it redirects to shows the result
+        elif self.path.startswith("/api/settings"):
+            alerts.save_events(self._form())  # a ticked box is a field; an unticked one is absent
+        elif self.path.startswith("/api/wifi"):
+            _notes["wifi"] = enable_wifi(urllib.parse.unquote(self.path.partition("serial=")[2]))
+        elif self.path.startswith("/api/nickname"):
+            form = self._form()
+            serial = urllib.parse.unquote(self.path.partition("serial=")[2])
+            if not set_nickname(serial, form.get("nickname", [""])[0]):
+                return self._send(404, "unknown device", "text/plain")
+        elif not self.path.startswith("/api/backup"):
             return self._send(404, "not found", "text/plain")
-        serial = urllib.parse.unquote(self.path.partition("serial=")[2]) or None
-        if _lock.locked():
-            return self._send(409, "a backup is already running", "text/plain")
-        threading.Thread(target=run_now, args=([serial] if serial else None,), daemon=True).start()
+        else:
+            serial = urllib.parse.unquote(self.path.partition("serial=")[2]) or None
+            if _lock.locked():
+                return self._send(409, "a backup is already running", "text/plain")
+            threading.Thread(target=run_now, args=([serial] if serial else None,), daemon=True).start()
         self.send_response(303)
         self.send_header("Location", "/")
         self.end_headers()
@@ -715,8 +906,10 @@ def cmd_serve(_args):
             s["running"] = False
         if st:
             STATE_FILE.write_text(json.dumps(st, indent=1, sort_keys=True))
+    alerts.describe()
     adb("start-server", timeout=30)
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=stale_watch, daemon=True).start()
     threading.Thread(target=watcher, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 

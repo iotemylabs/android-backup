@@ -2,6 +2,7 @@
 
 Run: python -m unittest discover -s tests
 """
+import os
 import subprocess
 import tempfile
 import time
@@ -49,7 +50,7 @@ class Limit(unittest.TestCase):
                 mock.patch.object(ab, "list_files", return_value=files), \
                 mock.patch.object(ab, "pull", side_effect=lambda a, r, dest, size=0: pulled.append(r)), \
                 mock.patch.object(ab, "update_state"):
-            n, copied, failed, done, deferred = ab.sync_files(WIFI, "S", Path(d), open("/dev/null", "wb"),
+            n, copied, failed, done, deferred = ab.sync_files(WIFI, "S", Path(d), open(os.devnull, "wb"),
                                                                limit=500_000_000)
         self.assertEqual(pulled, ["/sdcard/Documents/b.txt", "/sdcard/DCIM/c.jpg"])
         self.assertEqual(deferred, 300_000_000)

@@ -1,0 +1,131 @@
+# Home Assistant package for android-backup: sensors for one phone, and a stale-backup alert.
+#
+# Use it as a package (configuration.yaml: `homeassistant: { packages: !include_dir_named packages }`,
+# then save this file as packages/android_backup.yaml), or copy each top-level block into
+# configuration.yaml. Written for Home Assistant 2024.10 or later.
+#
+# Replace before use:
+#   SERVER_IP        the server running android-backup (it has no login, so keep it on your LAN)
+#   PHONE_SERIAL     the phone's serial, as shown on the status page
+#   mobile_app_YOUR_PHONE   your Companion app's notify service
+# For a second phone, copy the blocks and change the names, unique_ids and serial.
+
+rest:
+  - resource: http://SERVER_IP:9872/api/ha
+    scan_interval: 30  # short, so the progress notification below keeps moving
+    sensor:
+      - name: "Phone backup progress"
+        unique_id: android_backup_phone_backup_progress
+        unit_of_measurement: "%"
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='progress') | first | default(0)) }}
+      - name: "Phone last backup"
+        unique_id: android_backup_phone_last_backup
+        device_class: timestamp
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='last_backup') | first | default(none)) }}
+        availability: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='last_backup') | first | default(none)) is not none }}
+      - name: "Phone last result"
+        unique_id: android_backup_phone_last_result
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='result') | first | default('never')) }}
+      - name: "Phone backup size"
+        unique_id: android_backup_phone_backup_size
+        device_class: data_size
+        unit_of_measurement: B
+        state_class: measurement
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='size_bytes') | first | default(0)) }}
+      - name: "Phone backup duration"
+        unique_id: android_backup_phone_backup_duration
+        device_class: duration
+        unit_of_measurement: s
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='duration_seconds') | first | default(none)) }}
+        availability: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='duration_seconds') | first | default(none)) is not none }}
+    binary_sensor:
+      - name: "Phone backup connected"
+        unique_id: android_backup_phone_connected
+        device_class: connectivity
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='connected') | first | default(false)) }}
+      - name: "Phone backup running"
+        unique_id: android_backup_phone_running
+        device_class: running
+        value_template: >-
+          {{ (value_json | selectattr('serial', 'eq', 'PHONE_SERIAL') | map(attribute='running') | first | default(false)) }}
+
+template:
+  # Holds the last known backup time while the REST sensor is unavailable. Without it, a dead
+  # container would make the sensor "unavailable" and the stale check below would have nothing to read.
+  - triggers:
+      - trigger: state
+        entity_id: sensor.phone_last_backup
+        not_to:
+          - unavailable
+          - unknown
+    sensor:
+      - name: "Phone last backup held"
+        unique_id: android_backup_phone_last_backup_held
+        device_class: timestamp
+        state: "{{ trigger.to_state.state }}"
+
+automation:
+  # One persistent notification in the sidebar that updates in place while a backup runs
+  # (same notification_id each time), then shows the result when it ends.
+  - alias: "Phone backup progress notification"
+    id: android_backup_phone_progress
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: sensor.phone_backup_progress
+        id: progress
+      - trigger: state
+        entity_id: binary_sensor.phone_backup_running
+        from: "on"
+        to: "off"
+        id: finished
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: progress
+              - condition: state
+                entity_id: binary_sensor.phone_backup_running
+                state: "on"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  notification_id: android_backup_phone
+                  title: "Phone backup running"
+                  message: "{{ states('sensor.phone_backup_progress') }}% backed up"
+          - conditions:
+              - condition: trigger
+                id: finished
+            sequence:
+              - delay: "00:00:35"  # let the REST sensor pick up the result first
+              - action: persistent_notification.create
+                data:
+                  notification_id: android_backup_phone
+                  title: "Phone backup finished"
+                  message: >-
+                    Result: {{ states('sensor.phone_last_result') }}.
+                    Size: {{ (states('sensor.phone_backup_size') | float(0) / 1e9) | round(1) }} GB.
+
+  # Uses Home Assistant's own clock (now()), so it fires even if the container or the server is down.
+  - alias: "Phone backup is stale"
+    id: android_backup_phone_stale
+    triggers:
+      - trigger: template
+        value_template: >-
+          {{ states('sensor.phone_last_backup_held') not in ('unknown', 'unavailable')
+             and now() - (states('sensor.phone_last_backup_held') | as_datetime) > timedelta(hours=48) }}
+    actions:
+      - action: notify.mobile_app_YOUR_PHONE
+        data:
+          title: "Phone backup is stale"
+          message: >-
+            No good backup since {{ states('sensor.phone_last_backup_held') | as_datetime | as_local }}.
+            Check that the phone is on Wi-Fi and that android-backup is running.

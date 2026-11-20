@@ -9,6 +9,10 @@ ADD https://dl.google.com/android/repository/platform-tools_r37.0.1-linux.zip /t
 RUN python -c "import zipfile; zipfile.ZipFile('/tmp/platform-tools.zip').extract('platform-tools/adb', '/opt')" \
  && chmod +x /opt/platform-tools/adb && ln -s /opt/platform-tools/adb /usr/local/bin/adb && rm /tmp/platform-tools.zip
 
+# Before the code, so a code change doesn't reinstall them. No cache or bytecode: they'd double the layer.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --no-compile -r /tmp/requirements.txt && rm /tmp/requirements.txt
+
 COPY android_backup /app/android_backup
 COPY android-backup /usr/local/bin/android-backup
 RUN chmod +x /usr/local/bin/android-backup

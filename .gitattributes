@@ -1,0 +1,4 @@
+# These run inside a Linux image, so a Windows checkout must not give them CRLF line endings.
+android-backup text eol=lf
+*.sh text eol=lf
+*.py text eol=lf

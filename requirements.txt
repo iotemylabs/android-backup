@@ -1,0 +1,2 @@
+# Alerts (ntfy, Home Assistant, Discord and more). BSD-2-Clause.
+apprise==2.2.0
